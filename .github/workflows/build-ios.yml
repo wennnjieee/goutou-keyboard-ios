@@ -1,0 +1,725 @@
+# 无 Mac 构建 iOS 键盘扩展：GitHub Actions macOS runner 上 xcodegen + xcodebuild。
+#
+# 一条流水线出两种产物：
+#   1. 未签名 IPA  —— 不需要任何 Secret，push main 就跑，产物在 Artifacts 里，可用 Sideloadly 侧载
+#   2. 已签名 ad-hoc IPA + 装机页 —— 配好 Secrets 后打 tag 触发
+#
+# 触发方式:
+#   A. push main   → 只跑未签名构建（快，验证能不能编译）
+#   B. push tag    → adhoc-v1.0.0，配了 Secrets 就出签名包
+#   C. 手动        → gh workflow run build-ios.yml --ref main
+#
+# 使用前: 改下面 env 的 APP_NAME / SCHEME / BUNDLE_ID / EXTENSION_BUNDLE_ID
+#        （要签名分发时再改 OTA_URL_BASE / OTA_DIR，并按 docs/01 配 Secrets）
+
+name: Build iOS Keyboard
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'adhoc-v*'
+
+env:
+  APP_NAME: GoutouInput                            # 宿主 App 的 target / 产物名
+  EXTENSION_NAME: GoutouKeyboard                   # 键盘扩展的 target 名
+  SCHEME: GoutouInput                              # xcodegen 生成的 scheme 名
+  BUNDLE_ID: com.example.goutouinput               # 改成你注册的 Bundle ID
+  EXTENSION_BUNDLE_ID: com.example.goutouinput.keyboard
+  OTA_URL_BASE: https://your-domain.com/install    # OTA 装机页 HTTPS 地址（要可信证书）
+  OTA_DIR: /var/www/install                        # OTA 文件在服务器上的目录
+
+jobs:
+  build:
+    # 阶段 12A 起用 xcode-27 镜像（Xcode 27.0 / iOS 27 SDK）：iOS 版 ScreenCaptureKit
+    # 是 iOS 27.0+ 的框架，macos-15 / macos-26 镜像的 SDK 里根本没有这个模块。
+    runs-on: xcode-27
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # build number 用 commit 数, 浅克隆会恒等于 1
+
+      - name: Select latest Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using Xcode: $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # 九键逻辑的冒烟测试：纯 Foundation，不需要模拟器，失败就整条流水线停在这儿。
+      - name: Smoke test nine-key logic
+        run: |
+          swiftc -swift-version 5 \
+            Keyboard/NineKeyMapper.swift \
+            Keyboard/GoutouPinyinTable.swift \
+            Keyboard/NineKeyInputEngine.swift \
+            Keyboard/GoutouConfig.swift \
+            Keyboard/GoutouPrompt.swift \
+            Keyboard/GoutouProfileStore.swift \
+            Keyboard/PersonMemory.swift \
+            Keyboard/GoutouMemoryRepository.swift \
+            Keyboard/MemoryRankingConfig.swift \
+            Keyboard/MemoryDecayConfig.swift \
+            Keyboard/MemoryMaintenance.swift \
+            Keyboard/MemoryManagement.swift \
+            Keyboard/MemorySelector.swift \
+            Keyboard/GoutouMemoryExtractor.swift \
+            Keyboard/GoutouSegmentStore.swift \
+            Keyboard/GoutouAIClient.swift \
+            tools/NineKeyCheck/main.swift \
+            -o "$RUNNER_TEMP/ninekeycheck"
+          "$RUNNER_TEMP/ninekeycheck"
+
+      # 剪贴板契约（两端共用）+ 版式解析 + 长图分片几何：纯 Foundation，不用模拟器就能验。
+      - name: Smoke test chat clipboard codec and layout parser
+        run: |
+          swiftc -swift-version 5 \
+            Shared/GoutouChatClipboard.swift \
+            App/ChatLayoutParser.swift \
+            Shared/GoutouChatBubbleScanner.swift \
+            Shared/GoutouChatOCRGeometry.swift \
+            tools/ChatLayoutCheck/main.swift \
+            tools/ChatLayoutCheck/ScreenshotFixtures.swift \
+            -o "$RUNNER_TEMP/chatlayoutcheck"
+          "$RUNNER_TEMP/chatlayoutcheck"
+
+      # 真 Vision 的合成回归在另一个 job（vision-regression，macos-15）跑：
+      # xcode-27 镜像的 macOS 27 上 Vision 文本识别整个不可用（旧 API 报
+      # TextRecognition.CRImageReaderError 9，新 API 报 e5rt 编译错误），
+      # 那是 runner 环境问题，不是我们的代码——所以回归留在能跑起来的镜像上。
+      - name: App Group probe filesystem contract
+        run: |
+          swiftc -swift-version 5 Shared/SharedConstants.swift Shared/AppGroupDiagnostics.swift tools/AppGroupProbeCheck/main.swift -o "$RUNNER_TEMP/appgroupprobecheck"
+          "$RUNNER_TEMP/appgroupprobecheck"
+
+      - name: Shared chat store filesystem contract
+        run: |
+          swiftc -swift-version 5 Shared/SharedConstants.swift Shared/GoutouChatClipboard.swift Shared/SharedChatStore.swift tools/SharedChatStoreCheck/main.swift -o "$RUNNER_TEMP/sharedchatstorecheck"
+          "$RUNNER_TEMP/sharedchatstorecheck"
+
+      # 阶段 8：预览 → 使用 → 取消使用 → 重新读取 的状态契约（纯 Foundation + 临时目录，不联网）。
+      - name: Recognized chat context state contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Keyboard/RecognizedChatContext.swift \
+            tools/RecognizedChatContextCheck/main.swift \
+            -o "$RUNNER_TEMP/recognizedchatcontextcheck"
+          "$RUNNER_TEMP/recognizedchatcontextcheck"
+
+      # 阶段 9~11：识别聊天分析的状态、Prompt、结构化结果与插入契约（spy 写入，不联网、不消耗 token）。
+      - name: Recognized chat analysis contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Keyboard/GoutouConfig.swift \
+            Keyboard/GoutouPrompt.swift \
+            Keyboard/GoutouAIClient.swift \
+            Keyboard/RecognizedChatContext.swift \
+            Keyboard/RecognizedChatAnalysis.swift \
+            tools/RecognizedChatAnalysisCheck/main.swift \
+            -o "$RUNNER_TEMP/recognizedchatanalysischeck"
+          "$RUNNER_TEMP/recognizedchatanalysischeck"
+
+      # 阶段 12A：动态屏幕识别的纯逻辑（状态机 / 节流 / 单 OCR in-flight / 阅读顺序）。
+      # 不碰 ScreenCaptureKit、不联网、不落盘，所以能在 macOS 上直接跑。
+      - name: Live screen capture contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Shared/SharedChatFingerprint.swift \
+            Keyboard/GoutouConfig.swift \
+            App/ScreenCapture/LiveOCRObservation.swift \
+            App/ScreenCapture/LiveOCRSnapshot.swift \
+            App/ScreenCapture/LiveScreenCaptureState.swift \
+            App/ScreenCapture/LiveScreenOCRProcessor.swift \
+            tools/LiveScreenCaptureCheck/main.swift \
+            -o "$RUNNER_TEMP/livescreencapturecheck"
+          "$RUNNER_TEMP/livescreencapturecheck"
+
+      # 阶段 12B：聊天消息结构化 + 保守角色判断 + 稳定化 + 滚动去重（纯逻辑，不联网、不落盘）。
+      - name: Live chat recognition contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Keyboard/GoutouConfig.swift \
+            App/ScreenCapture/LiveOCRObservation.swift \
+            App/ScreenCapture/LiveOCRSnapshot.swift \
+            App/ScreenCapture/LiveChatGeometryConfiguration.swift \
+            App/ScreenCapture/LiveChatCandidate.swift \
+            App/ScreenCapture/LiveChatRoleClassifier.swift \
+            App/ScreenCapture/LiveChatBlockGrouper.swift \
+            App/ScreenCapture/LiveChatStabilizer.swift \
+            App/ScreenCapture/LiveChatTimeline.swift \
+            App/ScreenCapture/LiveChatSystem.swift \
+            tools/LiveChatRecognitionCheck/main.swift \
+            -o "$RUNNER_TEMP/livechatreccheck"
+          "$RUNNER_TEMP/livechatreccheck"
+
+      # 阶段 12C：实时聊天 → 冻结草稿 → 用户确认 → 复用 SharedChatStore 正式保存。
+      - name: Live chat review contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Keyboard/GoutouConfig.swift \
+            App/ScreenCapture/LiveOCRObservation.swift \
+            App/ScreenCapture/LiveOCRSnapshot.swift \
+            App/ScreenCapture/LiveChatGeometryConfiguration.swift \
+            App/ScreenCapture/LiveChatCandidate.swift \
+            App/ScreenCapture/LiveChatRoleClassifier.swift \
+            App/ScreenCapture/LiveChatBlockGrouper.swift \
+            App/ScreenCapture/LiveChatStabilizer.swift \
+            App/ScreenCapture/LiveChatTimeline.swift \
+            App/ScreenCapture/LiveChatSystem.swift \
+            App/ScreenCapture/LiveChatReviewDraft.swift \
+            tools/LiveChatReviewCheck/main.swift \
+            -o "$RUNNER_TEMP/livechatreviewcheck"
+          "$RUNNER_TEMP/livechatreviewcheck"
+
+      # 阶段 12D：用户主动开启的自动同步（授权 / 资格 / fingerprint / debounce / 并发 / 代际 / 人工防覆盖）。
+      - name: Live chat auto sync contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Keyboard/GoutouConfig.swift \
+            App/ScreenCapture/LiveOCRObservation.swift \
+            App/ScreenCapture/LiveOCRSnapshot.swift \
+            App/ScreenCapture/LiveChatGeometryConfiguration.swift \
+            App/ScreenCapture/LiveChatCandidate.swift \
+            App/ScreenCapture/LiveChatRoleClassifier.swift \
+            App/ScreenCapture/LiveChatBlockGrouper.swift \
+            App/ScreenCapture/LiveChatStabilizer.swift \
+            App/ScreenCapture/LiveChatTimeline.swift \
+            App/ScreenCapture/LiveChatSystem.swift \
+            App/ScreenCapture/LiveChatReviewDraft.swift \
+            Shared/SharedChatFingerprint.swift \
+            App/ScreenCapture/LiveChatAutoSyncConfiguration.swift \
+            App/ScreenCapture/LiveChatAutoSyncState.swift \
+            App/ScreenCapture/LiveChatAutoSyncSession.swift \
+            App/ScreenCapture/LiveChatAutoSyncCoordinator.swift \
+            tools/LiveChatAutoSyncCheck/main.swift \
+            -o "$RUNNER_TEMP/livechatautosynccheck"
+          "$RUNNER_TEMP/livechatautosynccheck"
+
+      # 阶段 12E：键盘自动发现共享聊天更新 + 「使用最新聊天」的语义。
+      - name: Shared chat update contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Shared/SharedChatFingerprint.swift \
+            Keyboard/GoutouConfig.swift \
+            Keyboard/GoutouPrompt.swift \
+            Keyboard/GoutouAIClient.swift \
+            Keyboard/RecognizedChatContext.swift \
+            Keyboard/RecognizedChatAnalysis.swift \
+            Keyboard/SharedChatUpdateDetector.swift \
+            tools/SharedChatUpdateCheck/main.swift \
+            -o "$RUNNER_TEMP/sharedchatupdatecheck"
+          "$RUNNER_TEMP/sharedchatupdatecheck"
+
+      - name: Shared chat automatic load contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Shared/SharedChatFingerprint.swift \
+            Keyboard/GoutouConfig.swift \
+            Keyboard/GoutouPrompt.swift \
+            Keyboard/GoutouAIClient.swift \
+            Keyboard/RecognizedChatContext.swift \
+            Keyboard/RecognizedChatAnalysis.swift \
+            Keyboard/SharedChatUpdateDetector.swift \
+            Keyboard/SharedChatAutoLoader.swift \
+            tools/SharedChatAutoLoadCheck/main.swift \
+            -o "$RUNNER_TEMP/sharedchatautoloadcheck"
+          "$RUNNER_TEMP/sharedchatautoloadcheck"
+
+      # 阶段 12E：聊天界面门控（只有稳定判定为聊天界面才允许 OCR → 时间线 → 自动同步）。
+      - name: Chat screen detection contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Shared/SharedChatFingerprint.swift \
+            Keyboard/GoutouConfig.swift \
+            App/ScreenCapture/LiveOCRObservation.swift \
+            App/ScreenCapture/LiveOCRSnapshot.swift \
+            App/ScreenCapture/LiveChatGeometryConfiguration.swift \
+            App/ScreenCapture/LiveChatCandidate.swift \
+            App/ScreenCapture/LiveChatRoleClassifier.swift \
+            App/ScreenCapture/LiveChatBlockGrouper.swift \
+            App/ScreenCapture/LiveChatStabilizer.swift \
+            App/ScreenCapture/LiveChatTimeline.swift \
+            App/ScreenCapture/LiveChatSystem.swift \
+            App/ScreenCapture/LiveChatAutoSyncConfiguration.swift \
+            App/ScreenCapture/LiveChatAutoSyncState.swift \
+            App/ScreenCapture/LiveChatAutoSyncSession.swift \
+            App/ScreenCapture/ChatSceneGate.swift \
+            App/ScreenCapture/LiveChatScenePipeline.swift \
+            tools/ChatScreenDetectionCheck/main.swift \
+            -o "$RUNNER_TEMP/chatscreendetectioncheck"
+          "$RUNNER_TEMP/chatscreendetectioncheck"
+
+      # 阶段 12E（Final）：灵动岛 / 锁屏 Live Activity 的纯逻辑契约
+      # （只有真的开始捕获才建、去重、节流、停止/失败收尾、内容里没有正文）。
+      # ActivityKit 只检查决策与内容映射；真实灵动岛只能真机验收。
+      - name: Capture activity contract
+        run: |
+          swiftc -swift-version 5 \
+            Shared/SharedConstants.swift \
+            Shared/GoutouChatClipboard.swift \
+            Shared/SharedChatStore.swift \
+            Shared/SharedChatFingerprint.swift \
+            Keyboard/GoutouConfig.swift \
+            App/ScreenCapture/LiveOCRObservation.swift \
+            App/ScreenCapture/LiveOCRSnapshot.swift \
+            App/ScreenCapture/LiveScreenCaptureState.swift \
+            App/ScreenCapture/LiveChatGeometryConfiguration.swift \
+            App/ScreenCapture/LiveChatCandidate.swift \
+            App/ScreenCapture/LiveChatRoleClassifier.swift \
+            App/ScreenCapture/LiveChatBlockGrouper.swift \
+            App/ScreenCapture/LiveChatStabilizer.swift \
+            App/ScreenCapture/LiveChatTimeline.swift \
+            App/ScreenCapture/LiveChatSystem.swift \
+            App/ScreenCapture/LiveChatAutoSyncConfiguration.swift \
+            App/ScreenCapture/LiveChatAutoSyncState.swift \
+            App/ScreenCapture/LiveChatAutoSyncSession.swift \
+            App/ScreenCapture/ChatSceneGate.swift \
+            App/ScreenCapture/GoutouCaptureActivityState.swift \
+            App/ScreenCapture/GoutouCaptureActivityController.swift \
+            tools/CaptureActivityCheck/main.swift \
+            -o "$RUNNER_TEMP/captureactivitycheck"
+          "$RUNNER_TEMP/captureactivitycheck"
+
+      - name: FINAL baseline regression proof
+        run: python3 tools/run-final-regressions.py
+
+      - name: Inspect actual iOS SDK framework interfaces
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          for framework in ActivityKit WidgetKit ScreenCaptureKit; do
+            test -d "$SDK/System/Library/Frameworks/$framework.framework"
+            echo "Verified SDK framework: $framework"
+          done
+          grep -m 3 -E 'func (request|update|end)|static func request' "$SDK/System/Library/Frameworks/ActivityKit.framework/Modules/ActivityKit.swiftmodule/arm64e-apple-ios.swiftinterface" || true
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          xcodebuild -list -project $APP_NAME.xcodeproj
+
+      # 2.8 第 16 项：Debug 也要能构建（模拟器 SDK，不签名）
+      - name: Debug build check (simulator)
+        run: |
+          xcodebuild build \
+            -project $APP_NAME.xcodeproj \
+            -scheme $SCHEME \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Run keyboard panel UIKit regression (simulator)
+        timeout-minutes: 12
+        run: |
+          SIM_ID=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(v["udid"] for k,vs in d["devices"].items() if "iOS" in k for v in vs if v["name"].startswith("iPhone")))')
+          xcodebuild test -project "$APP_NAME.xcodeproj" -scheme GoutouPanelTests \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Resolve build number and version
+        run: |
+          echo "BUILD_NUM=$(git rev-list --count HEAD)" >> $GITHUB_ENV
+          echo "VERSION=$(grep -m1 'MARKETING_VERSION:' project.yml | sed 's/.*"\(.*\)".*/\1/')" >> $GITHUB_ENV
+
+      # ── 1. 未签名构建：不需要任何 Secret，先用它确认「真的能编译」───────────
+      - name: Build unsigned archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/unsigned"
+          xcodebuild archive \
+            -project $APP_NAME.xcodeproj \
+            -scheme $SCHEME \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/unsigned/$APP_NAME.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Package unsigned IPA
+        run: |
+          UNSIGNED_IPA="$(pwd)/$APP_NAME-Final-unsigned-$BUILD_NUM.ipa"
+          echo "UNSIGNED_IPA=$UNSIGNED_IPA" >> $GITHUB_ENV
+          cd "$RUNNER_TEMP/unsigned"
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/unsigned/$APP_NAME.xcarchive/Products/Applications/$APP_NAME.app" Payload/
+          ls -la Payload/$APP_NAME.app
+          echo "--- 扩展是否被正确嵌进 App ---"
+          ls -la "Payload/$APP_NAME.app/PlugIns/" || echo "!! PlugIns 目录不存在，扩展没被嵌入"
+          for ext in GoutouKeyboard.appex GoutouCaptureWidget.appex; do
+            if [ ! -d "Payload/$APP_NAME.app/PlugIns/$ext" ]; then
+              echo "!! 缺扩展 $ext —— 扩展没被正确嵌入"
+              exit 1
+            fi
+            echo "OK 已嵌入 $ext"
+          done
+          zip -qry "$UNSIGNED_IPA" Payload
+          unzip -l "$UNSIGNED_IPA" | head -20
+          ls -la "$UNSIGNED_IPA"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-unsigned
+          path: ${{ env.UNSIGNED_IPA }}
+          if-no-files-found: error
+
+      # ── 2. 已签名 ad-hoc 构建：只在 Secrets 配齐时执行 ────────────────────
+      - name: Detect signing secrets
+        id: signing
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          DEV_CERT: ${{ secrets.APPLE_DEV_CERTIFICATE_BASE64 }}
+          APP_PROFILE: ${{ secrets.APPLE_ADHOC_PROFILE_BASE64 }}
+          EXT_PROFILE: ${{ secrets.APPLE_ADHOC_EXT_PROFILE_BASE64 }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY: ${{ secrets.ASC_API_KEY_BASE64 }}
+          OTA_SSH_HOST: ${{ secrets.OTA_SSH_HOST }}
+        run: |
+          missing=""
+          for pair in \
+            "APPLE_CERTIFICATE_BASE64:$CERT" \
+            "APPLE_DEV_CERTIFICATE_BASE64:$DEV_CERT" \
+            "APPLE_ADHOC_PROFILE_BASE64:$APP_PROFILE" \
+            "APPLE_ADHOC_EXT_PROFILE_BASE64:$EXT_PROFILE" \
+            "APPLE_TEAM_ID:$TEAM_ID" \
+            "ASC_API_KEY_BASE64:$ASC_KEY"
+          do
+            name="${pair%%:*}"
+            value="${pair#*:}"
+            [ -z "$value" ] && missing="$missing $name"
+          done
+
+          if [ -z "$missing" ]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
+            echo "::notice::签名 Secrets 已配齐，继续出 ad-hoc 签名包。"
+          else
+            echo "enabled=false" >> $GITHUB_OUTPUT
+            echo "::notice title=跳过签名构建::缺这些 Secrets:$missing —— 本次只产出未签名 IPA（可侧载安装）。补齐后重跑即可。"
+          fi
+
+          if [ -n "$OTA_SSH_HOST" ]; then
+            echo "ota=true" >> $GITHUB_OUTPUT
+          else
+            echo "ota=false" >> $GITHUB_OUTPUT
+            echo "::notice title=跳过 OTA 部署::没有配 OTA_SSH_HOST，签名 IPA 只放进 Artifacts。"
+          fi
+
+      - name: Install certificates
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_DEV_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEV_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_DEV_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEV_CERTIFICATE_PASSWORD }}
+        run: |
+          DIST_CERT=$RUNNER_TEMP/dist.p12
+          DEV_CERT=$RUNNER_TEMP/dev.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 12)
+
+          echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o $DIST_CERT
+          echo -n "$APPLE_DEV_CERTIFICATE_BASE64" | base64 --decode -o $DEV_CERT
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $DIST_CERT -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security import $DEV_CERT -P "$APPLE_DEV_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+      - name: Install Ad-Hoc provisioning profiles
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APP_PROFILE_BASE64: ${{ secrets.APPLE_ADHOC_PROFILE_BASE64 }}
+          EXT_PROFILE_BASE64: ${{ secrets.APPLE_ADHOC_EXT_PROFILE_BASE64 }}
+        run: |
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILE_DIR"
+          echo -n "$APP_PROFILE_BASE64" | base64 --decode -o "$PROFILE_DIR/AdHocApp.mobileprovision"
+          echo -n "$EXT_PROFILE_BASE64" | base64 --decode -o "$PROFILE_DIR/AdHocKeyboard.mobileprovision"
+
+          APP_PROFILE_NAME=$(security cms -D -i "$PROFILE_DIR/AdHocApp.mobileprovision" | plutil -extract Name raw -)
+          EXT_PROFILE_NAME=$(security cms -D -i "$PROFILE_DIR/AdHocKeyboard.mobileprovision" | plutil -extract Name raw -)
+          echo "App profile: $APP_PROFILE_NAME"
+          echo "Keyboard profile: $EXT_PROFILE_NAME"
+          echo "APP_PROFILE_NAME=$APP_PROFILE_NAME" >> $GITHUB_ENV
+          echo "EXT_PROFILE_NAME=$EXT_PROFILE_NAME" >> $GITHUB_ENV
+
+      - name: Setup App Store Connect API key
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+        run: |
+          mkdir -p ~/private_keys
+          echo -n "$ASC_API_KEY_BASE64" | base64 --decode -o ~/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
+      - name: Set build number
+        if: steps.signing.outputs.enabled == 'true'
+        run: agvtool new-version -all $BUILD_NUM
+
+      # archive 阶段必须 Automatic signing：manual 只在 export 阶段用 ExportOptions.plist 完成。
+      - name: Build signed archive
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signed"
+          xcodebuild archive \
+            -project $APP_NAME.xcodeproj \
+            -scheme $SCHEME \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/signed/$APP_NAME.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath ~/private_keys/AuthKey_${ASC_KEY_ID}.p8 \
+            -authenticationKeyID $ASC_KEY_ID \
+            -authenticationKeyIssuerID $ASC_ISSUER_ID \
+            DEVELOPMENT_TEAM=$APPLE_TEAM_ID \
+            CODE_SIGN_STYLE=Automatic \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Export signed IPA (ad-hoc)
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > $RUNNER_TEMP/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>ad-hoc</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>uploadBitcode</key>
+            <false/>
+            <key>uploadSymbols</key>
+            <false/>
+            <key>compileBitcode</key>
+            <false/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>${APP_PROFILE_NAME}</string>
+              <key>${EXTENSION_BUNDLE_ID}</key>
+              <string>${EXT_PROFILE_NAME}</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/signed/$APP_NAME.xcarchive" \
+            -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist \
+            -exportPath "$RUNNER_TEMP/signed/export"
+
+          ls -la $RUNNER_TEMP/signed/export/
+
+      - name: Generate manifest.plist + install.html
+        if: steps.signing.outputs.enabled == 'true'
+        run: |
+          IPA_NAME="${APP_NAME}-test-${BUILD_NUM}.ipa"
+          echo "IPA_NAME=$IPA_NAME" >> $GITHUB_ENV
+          mv $RUNNER_TEMP/signed/export/$APP_NAME.ipa $RUNNER_TEMP/signed/export/$IPA_NAME
+
+          cat > $RUNNER_TEMP/signed/export/manifest.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>items</key>
+            <array>
+              <dict>
+                <key>assets</key>
+                <array>
+                  <dict>
+                    <key>kind</key>
+                    <string>software-package</string>
+                    <key>url</key>
+                    <string>${OTA_URL_BASE}/${IPA_NAME}</string>
+                  </dict>
+                </array>
+                <key>metadata</key>
+                <dict>
+                  <key>bundle-identifier</key>
+                  <string>${BUNDLE_ID}</string>
+                  <key>bundle-version</key>
+                  <string>${VERSION}</string>
+                  <key>kind</key>
+                  <string>software</string>
+                  <key>title</key>
+                  <string>${APP_NAME} Test</string>
+                </dict>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          PLIST
+
+          BUILD_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')
+          cat > $RUNNER_TEMP/signed/export/install.html <<HTML
+          <!DOCTYPE html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>${APP_NAME} 测试包安装</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 40px 20px; max-width: 480px; margin: 0 auto; text-align: center; background: #f5f5f7; }
+              h1 { color: #007AFF; margin-bottom: 8px; }
+              .tag { background: #FF9500; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; display: inline-block; }
+              .install { display: inline-block; background: #007AFF; color: white; padding: 18px 48px; border-radius: 14px; text-decoration: none; font-size: 18px; font-weight: 600; margin: 24px 0; box-shadow: 0 4px 12px rgba(0,122,255,0.3); }
+              .install:active { background: #0051D5; }
+              .meta { color: #666; font-size: 14px; line-height: 1.7; background: white; padding: 16px; border-radius: 12px; margin-top: 16px; text-align: left; }
+              .warn { color: #FF3B30; font-size: 13px; margin-top: 16px; }
+            </style>
+          </head>
+          <body>
+            <h1>${APP_NAME}</h1>
+            <p><span class="tag">测试包</span></p>
+            <p><a class="install" href="itms-services://?action=download-manifest&amp;url=${OTA_URL_BASE}/manifest.plist">安装 Install</a></p>
+            <div class="meta">
+              <strong>版本</strong>: ${VERSION} (build ${BUILD_NUM})<br>
+              <strong>构建时间</strong>: ${BUILD_TIME}<br>
+              <strong>包名</strong>: ${IPA_NAME}
+            </div>
+            <p class="warn">必须用 Safari 打开此页面。装完后回到桌面 → 设置 → 通用 → VPN 与设备管理 → 信任开发者证书。</p>
+            <p class="warn">装好后去 设置 → 通用 → 键盘 → 键盘 → 添加新键盘 → 狗头军师。</p>
+          </body>
+          </html>
+          HTML
+
+          ls -la $RUNNER_TEMP/signed/export/
+
+      - name: Upload signed IPA
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-adhoc-signed
+          path: |
+            ${{ runner.temp }}/signed/export/${{ env.IPA_NAME }}
+            ${{ runner.temp }}/signed/export/manifest.plist
+            ${{ runner.temp }}/signed/export/install.html
+          if-no-files-found: error
+
+      - name: Deploy to OTA server
+        if: steps.signing.outputs.enabled == 'true' && steps.signing.outputs.ota == 'true'
+        env:
+          OTA_SSH_HOST: ${{ secrets.OTA_SSH_HOST }}
+          OTA_SSH_USER: ${{ secrets.OTA_SSH_USER }}
+          OTA_SSH_PASSWORD: ${{ secrets.OTA_SSH_PASSWORD }}
+        run: |
+          brew install hudochenkov/sshpass/sshpass
+
+          sshpass -p "$OTA_SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
+            $OTA_SSH_USER@$OTA_SSH_HOST \
+            "mkdir -p $OTA_DIR && rm -f $OTA_DIR/*.ipa $OTA_DIR/manifest.plist $OTA_DIR/install.html"
+
+          sshpass -p "$OTA_SSH_PASSWORD" scp -o StrictHostKeyChecking=no \
+            "$RUNNER_TEMP/signed/export/$IPA_NAME" \
+            "$RUNNER_TEMP/signed/export/manifest.plist" \
+            "$RUNNER_TEMP/signed/export/install.html" \
+            $OTA_SSH_USER@$OTA_SSH_HOST:$OTA_DIR/
+
+          sshpass -p "$OTA_SSH_PASSWORD" ssh -o StrictHostKeyChecking=no \
+            $OTA_SSH_USER@$OTA_SSH_HOST \
+            "ls -la $OTA_DIR/"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 构建结果"
+            echo ""
+            echo "- 版本: ${VERSION} (build ${BUILD_NUM})"
+            echo "- 未签名 IPA: \`${APP_NAME}-Final-unsigned-${BUILD_NUM}.ipa\`（Artifacts，可侧载，不需要 Apple 开发者账号）"
+            if [ "${{ steps.signing.outputs.enabled }}" = "true" ]; then
+              echo "- 已签名 ad-hoc IPA: \`${IPA_NAME}\`"
+              echo "- OTA 装机页（Safari 打开）: ${OTA_URL_BASE}/install.html"
+            else
+              echo "- 已签名 IPA: 未生成（Secrets 没配齐，见上一条 notice）"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Clean up
+        if: always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+          rm -rf ~/private_keys
+
+  # 真 Vision 的合成回归单独跑在 macos-15 上：xcode-27 镜像的 macOS 27 上
+  # Vision 文本识别整个不可用（CRImageReaderError 9 / e5rt 编译失败），换镜像会失去这层保护。
+  vision-regression:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using Xcode: $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      # 真 Vision 的合成回归：现场画一张匿名聊天截图 → 走同一套识别 / 换算 / 气泡扫描 / 版式解析 → 断言归属。
+      # 和纯逻辑测试**分开**：合成坐标过了不代表 OCR 也过了，这里才是真的过了一遍 Vision。
+      - name: Vision OCR synthetic regression (macOS)
+        run: |
+          swiftc -swift-version 5 \
+            Shared/GoutouChatClipboard.swift \
+            Shared/GoutouChatBubbleScanner.swift \
+            App/ChatLayoutParser.swift \
+            Shared/GoutouChatOCRGeometry.swift \
+            App/ChatOCRService.swift \
+            tools/ChatVisionCheck/main.swift \
+            -o "$RUNNER_TEMP/chatvisioncheck"
+          "$RUNNER_TEMP/chatvisioncheck"

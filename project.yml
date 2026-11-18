@@ -1,0 +1,159 @@
+# XcodeGen 工程描述 —— 仓库里只放这个 + 源码，不提交 .xcodeproj（没有 Mac 没法维护它）。
+# CI 上 `xcodegen generate` 会现场生成工程。
+#
+# 注意: MARKETING_VERSION 必须带引号, workflow 靠 grep 这一行取版本号。
+
+name: GoutouInput
+
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  # 宿主 App：配置军师接口 + 截图 OCR → 剪贴板
+  GoutouInput:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+      - path: Shared
+      # 配置结构在 App 和键盘两边共用同一份（Foundation only，不依赖 UIKit）。
+      - path: Keyboard/GoutouConfig.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.goutouinput
+        PRODUCT_NAME: GoutouInput
+        CODE_SIGN_ENTITLEMENTS: App/GoutouInput.entitlements
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        VERSIONING_SYSTEM: apple-generic
+    dependencies:
+      - target: GoutouKeyboard
+        embed: true
+        codeSign: true
+      # 灵动岛 / 锁屏状态 + 控制中心快捷入口（WidgetKit 扩展）
+      - target: GoutouCaptureWidget
+        embed: true
+        codeSign: true
+
+  # 动态识别的系统级状态入口：Live Activity（灵动岛 / 锁屏）+ 控制中心 Control。
+  # 它不读聊天存储、不碰 AI、不碰 API Key，只画主 App 推过来的状态。
+  GoutouCaptureWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Widget
+      # Activity 属性主 App 与扩展共用同一份定义
+      - path: Shared/LiveActivity
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.goutouinput.capturewidget
+        PRODUCT_NAME: GoutouCaptureWidget
+        INFOPLIST_FILE: Widget/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+        VERSIONING_SYSTEM: apple-generic
+        # ActivityKit 需要 16.1；控制中心 Control 需要 18，按可用性在代码里隔离
+        IPHONEOS_DEPLOYMENT_TARGET: "16.1"
+
+  # 键盘扩展：最小 QWERTY + 九键 + 军师面板
+  GoutouKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Keyboard
+        excludes:
+          - "GoutouSkill.md"
+          - "pinyin-chars.tsv"
+          - "pinyin-words.tsv"
+      # 通信契约、共享存储与 probe：键盘不需要 OCR 的界面和几何代码。
+      - path: Shared/GoutouChatClipboard.swift
+      - path: Shared/SharedConstants.swift
+      - path: Shared/AppGroupDiagnostics.swift
+      - path: Shared/SharedChatStore.swift
+      # 军师人格：和 Android / Web 共用同一个 SKILL.md，打进键盘 bundle 当 system prompt。
+      # 阶段 12E：共享聊天指纹两端共用，免得 App 与 Keyboard 对「是不是同一份聊天」判断不一致。
+      - path: Shared/SharedChatFingerprint.swift
+      - path: Keyboard/GoutouSkill.md
+        buildPhase: resources
+      # 九键拼音词库（由 tools/fetch-pinyin-data.py 从三份 MIT 数据生成）
+      - path: Keyboard/pinyin-chars.tsv
+        buildPhase: resources
+      - path: Keyboard/pinyin-words.tsv
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.goutouinput.keyboard
+        PRODUCT_NAME: GoutouKeyboard
+        CODE_SIGN_ENTITLEMENTS: Keyboard/GoutouKeyboard.entitlements
+        INFOPLIST_FILE: Keyboard/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+        VERSIONING_SYSTEM: apple-generic
+
+  GoutouPanelTestHost:
+    type: application
+    platform: iOS
+    sources:
+      - path: tools/PanelUITests/Host
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.goutouinput.paneltesthost
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # iOS 27 SDK 起，App 必须走 UIScene 生命周期；这一项生成 scene manifest。
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+
+  GoutouPanelTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: tools/PanelUITests/PanelTests.swift
+      - path: Keyboard
+        excludes: ["Info.plist", "GoutouKeyboard.entitlements", "GoutouSkill.md", "pinyin-chars.tsv", "pinyin-words.tsv"]
+      - path: Shared/GoutouChatClipboard.swift
+      - path: Shared/SharedConstants.swift
+      - path: Shared/AppGroupDiagnostics.swift
+      - path: Shared/SharedChatStore.swift
+      - path: Shared/SharedChatFingerprint.swift
+    dependencies:
+      - target: GoutouPanelTestHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.goutouinput.paneltests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/GoutouPanelTestHost.app/GoutouPanelTestHost"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+schemes:
+  GoutouPanelTests:
+    build:
+      targets:
+        GoutouPanelTestHost: all
+        GoutouPanelTests: [test]
+    test:
+      targets:
+        - GoutouPanelTests
+  GoutouInput:
+    build:
+      targets:
+        GoutouInput: all
+    run:
+      config: Debug
+    archive:
+      config: Release
